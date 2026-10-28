@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gene–Protein–Disease Explorer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+  <header class="hero">
+    <div class="eyebrow">BIOINFORMATICS • LEARNING TOOL</div>
+    <h1>Gene–Protein–Disease Explorer</h1>
+    <p>ค้นหาและสำรวจข้อมูลยีน โปรตีน และบทความวิจัยจากฐานข้อมูลสาธารณะ</p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>ค้นหาข้อมูล</h2>
+      <form id="search-form">
+        <label for="gene">Gene symbol (ยีนมนุษย์)</label>
+        <input id="gene" name="gene" placeholder="เช่น TP53, BRCA1, EGFR" required maxlength="40">
+        <label for="disease">Disease keyword (ไม่บังคับ)</label>
+        <input id="disease" name="disease" placeholder="เช่น breast cancer">
+        <div class="examples">ตัวอย่าง:
+          <button type="button" class="chip" data-gene="TP53">TP53</button>
+          <button type="button" class="chip" data-gene="BRCA1">BRCA1</button>
+          <button type="button" class="chip" data-gene="EGFR">EGFR</button>
+        </div>
+        <button id="submit" class="primary" type="submit">ค้นหาข้อมูล</button>
+      </form>
+      <p class="small muted">ข้อมูลถูกเรียกจาก NCBI Gene, UniProt และ PubMed เมื่อกดค้นหา จำเป็นต้องเชื่อมต่ออินเทอร์เน็ต</p>
+    </section>
+
+    <div id="status" role="status" aria-live="polite"></div>
+    <section id="results" hidden>
+      <section class="panel">
+        <div class="section-heading"><h2>ข้อมูลยีน (NCBI Gene)</h2><span class="tag">GENE</span></div>
+        <div id="gene-card"></div>
+      </section>
+      <section class="panel">
+        <div class="section-heading"><h2>กราฟความสัมพันธ์</h2><span class="tag">NETWORK</span></div>
+        <div id="network" aria-label="กราฟความสัมพันธ์ระหว่างยีนและโปรตีน"></div>
+        <p class="small muted">กราฟนี้แสดงยีนและโปรตีนที่พบจากแหล่งข้อมูลที่ดึงมา ส่วนโรค/บทความเป็นผลการค้นหาวรรณกรรม ไม่ใช่การยืนยันเหตุและผล</p>
+      </section>
+      <section class="panel">
+        <div class="section-heading"><h2>โปรตีนที่เกี่ยวข้อง (UniProt)</h2><span class="tag">PROTEIN</span></div>
+        <div id="proteins"></div>
+      </section>
+      <section class="panel">
+        <div class="section-heading"><h2>ข้อมูลโรคและวรรณกรรมที่เกี่ยวข้อง</h2><span class="tag">DISEASE</span></div>
+        <p><b>คำค้นโรค:</b> <span id="disease-keyword">ไม่ได้ระบุ</span></p>
+        <p id="disease-interpretation" class="muted small"></p>
+        <div id="articles"></div>
+      </section>
+      <section class="panel">
+        <div class="section-heading"><h2>สรุปข้อมูลด้วย AI</h2><span class="tag">AI SUMMARY</span></div>
+        <p class="small muted">AI จะสรุปจากข้อมูลที่ค้นพบในหน้านี้เท่านั้น และแสดงข้อจำกัดพร้อมแหล่งอ้างอิงที่มีอยู่</p>
+        <button id="summarize" class="primary" type="button">สร้างบทสรุปด้วย AI</button>
+        <p id="ai-status" class="small muted">{% if ai_enabled %}พบการตั้งค่า Gemini API key{% else %}ยังไม่ได้ตั้งค่า Gemini API key — ค้นหาข้อมูลได้ตามปกติ แต่ต้องตั้งค่า API key เพื่อใช้ AI{% endif %}</p>
+        <div id="ai-summary" class="ai-summary" hidden></div>
+      </section>
+      <section class="notice" id="notice"></section>
+    </section>
+    <footer>ระบบต้นแบบเพื่อการศึกษาเท่านั้น ไม่ใช้วินิจฉัยโรค ประเมินความเสี่ยง หรือให้คำแนะนำทางการแพทย์</footer>
+  </main>
+
+<script>
+const form = document.getElementById('search-form');
+const statusBox = document.getElementById('status');
+const results = document.getElementById('results');
+const submit = document.getElementById('submit');
+let latestSearchData = null;
+const summarizeButton = document.getElementById('summarize');
+
+async function readJsonResponse(response) {
+  const text = await response.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (error) {
+    console.error(
+      'Response is not JSON:',
+      response.status,
+      text
+    );
+
+    if (text.trimStart().toLowerCase().startsWith('<!doctype') ||
+        text.trimStart().startsWith('<html')) {
+      throw new Error(
+        `เซิร์ฟเวอร์ส่งหน้า HTML กลับมา (HTTP ${response.status}) ` +
+        'กรุณาตรวจสอบ URL ของ API และข้อผิดพลาดใน Flask Terminal'
+      );
+    }
+
+    throw new Error(
+      `เซิร์ฟเวอร์ส่งข้อมูลไม่ใช่ JSON (HTTP ${response.status})`
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      data.error || `เซิร์ฟเวอร์เกิดข้อผิดพลาด HTTP ${response.status}`
+    );
+  }
+
+  return data;
+}
+
+document.querySelectorAll('.chip').forEach(button => {
+  button.addEventListener('click', () => {
+    document.getElementById('gene').value = button.dataset.gene;
+    form.requestSubmit();
+  });
+});
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  })[c]);
+}
+function link(url, label) {
+  return `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`;
+}
+
+form.addEventListener('submit', async event => {
+  event.preventDefault();
+  const gene = document.getElementById('gene').value.trim();
+  const disease = document.getElementById('disease').value.trim();
+  if (!gene) return;
+  submit.disabled = true;
+  submit.textContent = 'กำลังค้นหา…';
+  results.hidden = true;
+  statusBox.className = 'status';
+  statusBox.textContent = 'กำลังดึงข้อมูลจาก NCBI, UniProt และ PubMed กรุณารอสักครู่';
+  try {
+    const params = new URLSearchParams({gene, disease});
+    
+    const response = await fetch(`/api/search?${params.toString()}`);
+    const data = await readJsonResponse(response);
+
+    latestSearchData = data;
+    const g = data.gene;
+    document.getElementById('gene-card').innerHTML = `
+      <h3>${esc(g.symbol)} — ${esc(g.description)}</h3>
+      <p><b>Gene ID:</b> ${esc(g.id)}</p>
+      <p><b>Organism:</b> ${esc(g.organism)}</p>
+      <p>${link(g.url, 'เปิดระเบียนต้นทางใน NCBI Gene ↗')}</p>`;
+    const proteins = data.proteins || [];
+    document.getElementById('proteins').innerHTML = proteins.length ? proteins.map(p => `
+      <article class="result-item">
+        <h3>${esc(p.name)}</h3>
+        <p><b>Gene:</b> ${esc(p.gene)} &nbsp; <b>Accession:</b> ${esc(p.accession)}</p>
+        <p>${esc(p.function)}</p><p>${link(p.url, 'ดูข้อมูล UniProt ↗')}</p>
+      </article>`).join('') : '<p>ไม่พบรายการโปรตีนจากคำค้นนี้ใน UniProt</p>';
+    document.getElementById('disease-keyword').textContent = data.disease?.keyword || 'ไม่ได้ระบุ';
+    document.getElementById('disease-interpretation').textContent = data.disease?.interpretation || '';
+    const articles = data.articles || [];
+    document.getElementById('articles').innerHTML = articles.length ? articles.map(a => `
+      <article class="result-item">
+        <h3>${link(a.url, a.title)}</h3>
+        <p>${esc(a.journal)} ${a.year ? '(' + esc(a.year) + ')' : ''} • PMID: ${esc(a.pmid)}</p>
+      </article>`).join('') : '<p>ไม่พบบทความที่ตรงกับคำค้นนี้</p>';
+    document.getElementById('notice').textContent = data.notice;
+    drawNetwork(g, proteins);
+    results.hidden = false;
+    statusBox.className = 'status success';
+    statusBox.textContent = `ค้นหา ${g.symbol} สำเร็จ • โปรตีน ${proteins.length} รายการ • บทความ ${articles.length} รายการ`;
+  } catch (error) {
+    statusBox.className = 'status error';
+    statusBox.textContent = error.message || 'เกิดข้อผิดพลาด';
+    latestSearchData = null;
+  } finally {
+    submit.disabled = false;
+    submit.textContent = 'ค้นหาข้อมูล';
+  }
+});
+
+summarizeButton.addEventListener('click', async () => {
+  const aiStatus = document.getElementById('ai-status');
+  const aiSummary = document.getElementById('ai-summary');
+  if (!latestSearchData) {
+    aiStatus.textContent = 'กรุณาค้นหายีนก่อนสร้างบทสรุป';
+    return;
+  }
+  summarizeButton.disabled = true;
+  summarizeButton.textContent = 'กำลังสรุป…';
+  aiStatus.textContent = 'กำลังส่งข้อมูลที่ค้นพบให้ AI สรุป กรุณารอสักครู่';
+  aiSummary.hidden = true;
+  try {
+    const response = await fetch('/api/summarize', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({gene: latestSearchData.gene, proteins: latestSearchData.proteins,
+        articles: latestSearchData.articles, disease: latestSearchData.disease_query})
+    });
+    
+    const data = await readJsonResponse(response);
+
+    aiSummary.textContent = data.summary + '\n\n' + data.notice;
+    aiSummary.hidden = false;
+    aiStatus.textContent = 'สร้างบทสรุปแล้วด้วยโมเดล ' + data.model;
+  } catch (error) {
+    aiStatus.textContent = error.message || 'เกิดข้อผิดพลาดในการสรุป';
+  } finally {
+    summarizeButton.disabled = false;
+    summarizeButton.textContent = 'สร้างบทสรุปด้วย AI';
+  }
+});
+
+function drawNetwork(gene, proteins) {
+  const nodes = [{id: 'gene', label: `${gene.symbol}\nGene ID: ${gene.id}`, group: 'gene'}];
+  const edges = [];
+  if (proteins.length) {
+    proteins.forEach((p, i) => {
+      const id = `protein-${i}`;
+      nodes.push({id, label: `${p.name}\n${p.accession}`, group: 'protein'});
+      edges.push({from: 'gene', to: id, label: 'gene annotation'});
+    });
+  } else {
+    nodes.push({id: 'none', label: 'ไม่พบโปรตีน', group: 'empty'});
+    edges.push({from: 'gene', to: 'none', dashes: true, label: 'no record'});
+  }
+  const container = document.getElementById('network');
+  new vis.Network(container, {nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges)}, {
+    nodes: {shape: 'box', margin: 12, font: {face: 'Arial', size: 14}},
+    groups: {
+      gene: {color: {background: '#dceafe', border: '#4778c7'}},
+      protein: {color: {background: '#d9f5e7', border: '#27835c'}},
+      empty: {color: {background: '#f3f4f6', border: '#9ca3af'}}
+    },
+    edges: {arrows: 'to', font: {size: 11, align: 'middle'}},
+    physics: {stabilization: true},
+    interaction: {hover: true}
+  });
+}
+</script>
+</body>
+</html>
